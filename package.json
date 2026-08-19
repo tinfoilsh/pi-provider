@@ -1,0 +1,46 @@
+{
+	"name": "@tinfoilsh/pi-provider",
+	"version": "0.1.0",
+	"description": "Verifiably-private models from Tinfoil secure enclaves, for the pi coding agent",
+	"type": "module",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/tinfoilsh/pi-provider.git"
+	},
+	"homepage": "https://tinfoil.sh/coding-agents",
+	"bugs": {
+		"url": "https://github.com/tinfoilsh/pi-provider/issues"
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"tinfoil",
+		"provider",
+		"privacy",
+		"confidential-computing",
+		"attestation"
+	],
+	"pi": {
+		"extensions": [
+			"./tinfoil.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
+	},
+	"files": [
+		"tinfoil.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"build": "echo 'nothing to build'",
+		"check": "echo 'nothing to check'"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}
