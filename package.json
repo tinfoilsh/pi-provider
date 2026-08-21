@@ -38,9 +38,16 @@
 	],
 	"scripts": {
 		"build": "echo 'nothing to build'",
-		"check": "echo 'nothing to check'"
+		"check": "tsc --noEmit"
 	},
 	"publishConfig": {
 		"access": "public"
+	},
+	"dependencies": {
+		"tinfoil": "^1.2.1"
+	},
+	"devDependencies": {
+		"@types/node": "^26.2.0",
+		"typescript": "^7.0.2"
 	}
 }

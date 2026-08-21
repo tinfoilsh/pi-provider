@@ -1,7 +1,5 @@
-import { spawn } from "node:child_process";
-// pi aliases only four pi-ai specifiers for extensions. "/compat" is one of
-// them, and it is a superset of the root entry. Deeper paths such as
-// "/api/openai-completions.lazy" do not resolve inside pi.
+// pi only aliases a few pi-ai specifiers for extensions. "/compat" is one,
+// and is a superset of the root entry; deeper paths do not resolve.
 import {
 	createProvider,
 	envApiKeyAuth,
@@ -12,202 +10,47 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
+// Resolves from this package's node_modules: pi loads extensions with jiti,
+// which uses normal Node resolution for anything it does not alias.
+import { SecureClient, type VerificationDocument } from "tinfoil";
 
 /**
  * Tinfoil provider for the pi coding agent.
  *
- * Points pi at the local Tinfoil Proxy, which verifies the upstream enclave's
- * attestation and pins the attested key. Requests never go straight to the
- * hosted endpoint: that would give audit-time verification only, not the
- * connection-time guarantee this extension exists to preserve.
+ * Attestation and encryption happen in-process via the `tinfoil` SDK: it
+ * verifies the enclave's SEV-SNP attestation and Sigstore-signed code digest,
+ * and encrypts every request body end-to-end with HPKE. Not a full external
+ * verifier (no independent AMD signature-chain check); for that use
+ * github.com/tinfoilsh/tinfoil-cli.
  *
  * See README.md for setup.
  */
 
 const PROVIDER_ID = "tinfoil";
 const ENTRY_TYPE = "tinfoil-report";
-const DEFAULT_PORT = 3301;
-const DEFAULT_BASE_URL = `http://127.0.0.1:${DEFAULT_PORT}/v1`;
-const PROXY_BIN = "tinfoil-proxy";
 const HELP_URL = "https://tinfoil.sh/coding-agents";
 
-const PROBE_TIMEOUT_MS = 3000;
 const DISCOVER_TIMEOUT_MS = 8000;
-const STARTUP_TIMEOUT_MS = 45000;
-const STARTUP_POLL_MS = 250;
-/** How long a probe result may guard requests before it is re-taken. */
-const STATE_TTL_MS = 30000;
 
-/** The document layout this extension was written against. */
+// The document layout this extension was written against. Drift is a
+// warning, not a failure: the attestation behind the fields is still checked.
 const KNOWN_SCHEMA_VERSION = 1;
 
 // =============================================================================
-// Verification document
+// Verification state
 // =============================================================================
 
-/** Subset of the proxy's /verification-document response that we render. */
-interface VerificationDocument {
-	schemaVersion?: number;
-	configRepo?: string;
-	enclaveHost?: string;
-	releaseTag?: string;
-	releaseDigest?: string;
-	codeFingerprint?: string;
-	enclaveFingerprint?: string;
-	tlsPublicKey?: string;
-	hpkePublicKey?: string;
-	selectedRouterEndpoint?: string;
-	securityVerified?: boolean;
-	verifiedAt?: string;
-	verifier?: { name?: string; version?: string };
-	codeMeasurement?: { type?: string; registers?: string[] };
-	enclaveMeasurement?: {
-		measurement?: { type?: string; registers?: string[] };
-		tlsPublicKeyFingerprint?: string;
-		hpkePublicKey?: string;
-	};
-	hardwareMeasurement?: Record<string, unknown>;
-	runtime?: {
-		instanceId?: string;
-		listener?: string;
-		software?: { name?: string; version?: string };
-	};
-}
-
-type ProxyState =
-	/** A proxy answered with a document that passed validation. */
-	| { kind: "verified"; document: VerificationDocument; note?: string }
-	/**
-	 * Something answers on the port, but its answer does not prove verification.
-	 *
-	 * `evidence` separates "we were told something is wrong" from "we could not
-	 * ask". Only the first justifies blocking requests. A proxy too old to serve
-	 * the document still attests exactly as it always did, so treating silence
-	 * as guilt would break working setups while stopping no attacker.
-	 */
-	| { kind: "unverified"; reason: string; evidence: "bad-document" | "no-endpoint" }
-	/** Nothing answers on the port. */
-	| { kind: "absent"; reason: string };
-
 /**
- * Reject a document that does not positively state a successful verification.
+ * The startup verdict. "failed" blocks every request (see the guard).
  *
- * A status indicator must fail closed. A missing field is not a pass, so every
- * check here demands the affirmative value, never the absence of a negative.
- *
- * This does not authenticate the proxy, and it cannot: the document is
- * unsigned, so any local process could replay a genuine one. Trust rests on
- * the assumption that a loopback port belongs to the program that claims it.
- * These checks catch an empty or partial answer, and schema drift.
+ * No "stale" state and no refresh TTL: verification is bound to the live
+ * connection and `SecureClient.fetch` re-attests on its own when the enclave
+ * rotates keys. Renderers read the document fresh on every call, so a
+ * recovered rotation still shows up.
  */
-function validate(document: VerificationDocument): string[] {
-	const problems: string[] = [];
-	if (document.securityVerified !== true) problems.push("securityVerified is not true");
-	if (!document.releaseDigest) problems.push("releaseDigest is missing");
-	if (!document.tlsPublicKey) problems.push("tlsPublicKey is missing");
-	return problems;
-}
-
-function originOf(baseUrl: string): string {
-	return new URL(baseUrl).origin;
-}
-
-/**
- * Ask the proxy for its verification document.
- *
- * A 404 means the port is held by something that is not a current Tinfoil
- * Proxy: either an outdated proxy, or an unrelated process. Both are reported
- * as "unverified", because pi must not present either one as attested.
- */
-async function probeProxy(baseUrl: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<ProxyState> {
-	const url = `${originOf(baseUrl)}/verification-document`;
-	let response: Response;
-	try {
-		response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-	} catch (error) {
-		return { kind: "absent", reason: error instanceof Error ? error.message : String(error) };
-	}
-	if (response.status === 404) {
-		return {
-			kind: "unverified",
-			reason: `${url} returned 404. The proxy is outdated, or another program holds the port.`,
-			evidence: "no-endpoint",
-		};
-	}
-	if (!response.ok) {
-		return { kind: "unverified", reason: `${url} returned HTTP ${response.status}.`, evidence: "no-endpoint" };
-	}
-	let document: VerificationDocument;
-	try {
-		document = (await response.json()) as VerificationDocument;
-	} catch (error) {
-		return {
-			kind: "unverified",
-			reason: `${url} returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
-			evidence: "bad-document",
-		};
-	}
-
-	const problems = validate(document);
-	if (problems.length) {
-		return {
-			kind: "unverified",
-			reason: `${url} did not prove verification: ${problems.join(", ")}.`,
-			evidence: "bad-document",
-		};
-	}
-
-	// Layout drift is worth saying out loud, but it is not a failed
-	// verification. Failing closed here would break every user on the day the
-	// proxy ships a new schema.
-	const version = document.schemaVersion;
-	const note =
-		version === KNOWN_SCHEMA_VERSION
-			? undefined
-			: `the proxy reports document schema ${version ?? "(none)"}, and this extension knows ${KNOWN_SCHEMA_VERSION}. ` +
-				`Some fields may read as "unknown". Update the extension.`;
-
-	return { kind: "verified", document, note };
-}
-
-// =============================================================================
-// Proxy autostart
-// =============================================================================
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * Spawn the proxy detached, so it outlives this pi session and every later
- * session adopts it. We never kill it. The proxy binds a fixed port, so the
- * operating system already guarantees a single instance: a duplicate exits
- * with EADDRINUSE instead of racing.
- */
-async function startProxy(baseUrl: string): Promise<{ started: boolean; reason?: string }> {
-	const port = new URL(baseUrl).port || String(DEFAULT_PORT);
-
-	let child: ReturnType<typeof spawn>;
-	try {
-		child = spawn(PROXY_BIN, ["--port", port], { detached: true, stdio: "ignore" });
-	} catch (error) {
-		return { started: false, reason: error instanceof Error ? error.message : String(error) };
-	}
-
-	const spawnFailure = new Promise<string | undefined>((resolve) => {
-		child.once("error", (error: NodeJS.ErrnoException) => {
-			resolve(error.code === "ENOENT" ? `${PROXY_BIN} is not on PATH.` : error.message);
-		});
-		child.once("exit", (code) => resolve(`${PROXY_BIN} exited with code ${code}.`));
-	});
-	child.unref();
-
-	const deadline = Date.now() + STARTUP_TIMEOUT_MS;
-	while (Date.now() < deadline) {
-		const failure = await Promise.race([spawnFailure, sleep(STARTUP_POLL_MS).then(() => undefined)]);
-		if (failure) return { started: false, reason: failure };
-		if ((await probeProxy(baseUrl, 1000)).kind !== "absent") return { started: true };
-	}
-	return { started: false, reason: `${PROXY_BIN} did not become ready in ${STARTUP_TIMEOUT_MS / 1000}s.` };
-}
+type VerifyState =
+	| { kind: "verified" }
+	| { kind: "failed"; reason: string };
 
 // =============================================================================
 // Model discovery
@@ -230,10 +73,7 @@ interface TinfoilApiModel {
 	};
 }
 
-/**
- * The API reports no output-token limit, so derive a conservative one from the
- * context window. Replace this once /v1/models exposes the real value.
- */
+/** /v1/models reports no output-token limit; derive a conservative one. */
 function deriveMaxTokens(contextWindow: number): number {
 	return Math.min(32768, Math.max(4096, Math.floor(contextWindow / 8)));
 }
@@ -259,11 +99,7 @@ function toModel(raw: TinfoilApiModel, baseUrl: string): Model<"openai-completio
 	};
 }
 
-/**
- * A coding agent needs chat plus tool calling. Anything else (embeddings,
- * audio, or a chat model without tools) would appear in the picker and then
- * fail in a way that is hard to read.
- */
+/** A coding agent needs chat plus tool calling; anything else fails in the picker. */
 function isUsable(raw: TinfoilApiModel): boolean {
 	if (!raw.id) return false;
 	if (raw.type && raw.type !== "chat") return false;
@@ -272,28 +108,100 @@ function isUsable(raw: TinfoilApiModel): boolean {
 	return true;
 }
 
+/**
+ * Used only when live discovery is impossible (verification failed or
+ * /v1/models errored). Inevitably stale, but safe: the guard still blocks
+ * all requests while unverified. Snapshot of https://inference.tinfoil.sh/v1/models,
+ * 2026-08; keep current when shipping releases.
+ */
+const FALLBACK_CATALOG: TinfoilApiModel[] = [
+	{
+		id: "kimi-k3",
+		name: "Kimi K3",
+		type: "chat",
+		context_window: 262144,
+		reasoning: true,
+		multimodal: true,
+		tool_calling: true,
+		pricing: { inputTokenPricePer1M: 4, outputTokenPricePer1M: 20 },
+	},
+	{
+		id: "deepseek-v4-flash",
+		name: "DeepSeek V4 Flash",
+		type: "chat",
+		context_window: 1048576,
+		reasoning: true,
+		tool_calling: true,
+		pricing: { inputTokenPricePer1M: 0.3, outputTokenPricePer1M: 0.7 },
+	},
+	{
+		id: "glm-5-2",
+		name: "GLM-5.2",
+		type: "chat",
+		context_window: 393216,
+		reasoning: true,
+		tool_calling: true,
+		pricing: { inputTokenPricePer1M: 1.5, outputTokenPricePer1M: 5.25 },
+	},
+	{
+		id: "gpt-oss-120b",
+		name: "GPT-OSS 120B",
+		type: "chat",
+		context_window: 131072,
+		reasoning: true,
+		tool_calling: true,
+		pricing: { inputTokenPricePer1M: 0.15, outputTokenPricePer1M: 0.6 },
+	},
+	{
+		id: "llama3-3-70b",
+		name: "Llama 3.3 70B",
+		type: "chat",
+		context_window: 131072,
+		tool_calling: true,
+		pricing: { inputTokenPricePer1M: 1.75, outputTokenPricePer1M: 2.75 },
+	},
+	{
+		id: "gemma4-31b",
+		name: "Gemma 4 31B",
+		type: "chat",
+		context_window: 262144,
+		reasoning: true,
+		multimodal: true,
+		tool_calling: true,
+		pricing: { inputTokenPricePer1M: 0.4, outputTokenPricePer1M: 1 },
+	},
+];
+
 interface Discovery {
 	models: Model<"openai-completions">[];
 	skipped: string[];
+	usedFallback: boolean;
 	error?: string;
 }
 
-async function discoverModels(baseUrl: string, signal?: AbortSignal): Promise<Discovery> {
+/**
+ * Discover models through the encrypted, verified channel; the response is
+ * OpenAI-shaped. `SecureClient.fetch` resolves the relative URL against the
+ * verified enclave and refuses any other origin.
+ */
+async function discoverModels(secureFetch: typeof fetch, baseUrl: string): Promise<Discovery> {
 	try {
-		const response = await fetch(`${baseUrl}/models`, {
-			signal: signal ?? AbortSignal.timeout(DISCOVER_TIMEOUT_MS),
+		const response = await secureFetch("/v1/models", {
+			signal: AbortSignal.timeout(DISCOVER_TIMEOUT_MS),
 		});
-		if (!response.ok) throw new Error(`HTTP ${response.status} from ${baseUrl}/models`);
+		if (!response.ok) throw new Error(`HTTP ${response.status} from /v1/models`);
 		const body = (await response.json()) as { data?: TinfoilApiModel[] };
 		const raw = body.data ?? [];
 		return {
 			models: raw.filter(isUsable).map((entry) => toModel(entry, baseUrl)),
 			skipped: raw.filter((entry) => !isUsable(entry)).map((entry) => entry.id ?? "(unnamed)"),
+			usedFallback: false,
 		};
 	} catch (error) {
 		return {
-			models: [],
+			models: FALLBACK_CATALOG.map((entry) => toModel(entry, baseUrl)),
 			skipped: [],
+			usedFallback: true,
 			error: error instanceof Error ? error.message : String(error),
 		};
 	}
@@ -303,18 +211,14 @@ async function discoverModels(baseUrl: string, signal?: AbortSignal): Promise<Di
 // Rendering
 // =============================================================================
 
-/**
- * Plain markers, not emoji. Emoji padlocks are double-width, and the open and
- * closed glyphs differ in width across fonts, so the footer jitters when the
- * state flips. Color carries the meaning; the marker carries it again for
- * users who cannot rely on color.
- */
+// Plain markers, not emoji: padlock glyphs differ in width across fonts, so
+// the footer would jitter when the state flips.
 const MARK_OK = "[\u2713]";
 const MARK_BAD = "[!]";
 
 const shortHash = (value?: string) => (value ? value.replace(/^sha256:/, "").slice(0, 12) : "unknown");
 
-function isTrusted(state: ProxyState): boolean {
+function isTrusted(state: VerifyState): boolean {
 	return state.kind === "verified";
 }
 
@@ -322,19 +226,19 @@ function mark(trusted: boolean): string {
 	return trusted ? MARK_OK : MARK_BAD;
 }
 
-/**
- * The summary in two parts, so callers can put the marker between them and
- * color each part on its own. The footer dims the words and colors only the
- * marker; the transcript colors the whole line.
- */
-function summaryParts(state: ProxyState): { verdict: string; detail: string } {
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/** Verdict and detail as separate parts so callers can color the marker on its own. */
+function summaryParts(state: VerifyState, document?: VerificationDocument): { verdict: string; detail: string } {
 	if (state.kind !== "verified") return { verdict: "Tinfoil unverified", detail: "" };
-	return { verdict: "Tinfoil verified", detail: shortHash(state.document.releaseDigest) };
+	return { verdict: "Tinfoil verified", detail: shortHash(document?.releaseDigest) };
 }
 
 /** Plain one-line summary, marker included. */
-function summary(state: ProxyState): string {
-	const { verdict, detail } = summaryParts(state);
+function summary(state: VerifyState, document?: VerificationDocument): string {
+	const { verdict, detail } = summaryParts(state, document);
 	return [verdict, mark(isTrusted(state)), detail].filter(Boolean).join(" ");
 }
 
@@ -345,49 +249,69 @@ interface TinfoilReport {
 	lines: string[];
 }
 
-function reportLines(state: ProxyState, baseUrl: string, models: number): string[] {
-	if (state.kind !== "verified") {
+/** One step line, in the order the verifier performs the steps. */
+function stepLines(document: VerificationDocument): string[] {
+	const steps = document.steps;
+	if (!steps) return [];
+	const entries: Array<[string, { status?: string; error?: string } | undefined]> = [
+		["Fetch digest", steps.fetchDigest],
+		["Verify code", steps.verifyCode],
+		["Verify enclave", steps.verifyEnclave],
+		["Compare measurements", steps.compareMeasurements],
+		["Verify certificate", steps.verifyCertificate],
+	];
+	return entries
+		.filter((pair): pair is [string, { status?: string; error?: string }] => pair[1] !== undefined)
+		.map(([name, step]) => `  ${name.padEnd(22)}${step.status ?? "unknown"}${step.error ? `: ${step.error}` : ""}`);
+}
+
+function reportLines(
+	state: VerifyState,
+	document: VerificationDocument | undefined,
+	baseUrl: string,
+	models: number,
+): string[] {
+	if (state.kind !== "verified" || !document) {
 		return [
 			`Base URL:  ${baseUrl}`,
-			`Reason:    ${state.reason}`,
+			`Reason:    ${state.kind === "failed" ? state.reason : "no verification document"}`,
 			"",
-			state.kind === "absent"
-				? `Start the proxy, then run /reload. See ${HELP_URL}`
-				: `Update the proxy (tinfoil-proxy --version), then run /reload. See ${HELP_URL}`,
+			`Run /tinfoil to retry verification. See ${HELP_URL}`,
 		];
 	}
 
-	const document = state.document;
 	const enclave = document.enclaveMeasurement ?? {};
 	return [
 		"Connection",
 		`  Base URL:        ${baseUrl}`,
-		`  Enclave host:    ${document.enclaveHost ?? "unknown"}`,
-		`  Router endpoint: ${document.selectedRouterEndpoint ?? "unknown"}`,
-		`  Config repo:     ${document.configRepo ?? "unknown"}`,
+		`  Enclave host:    ${document.enclaveHost || "unknown"}`,
+		`  Router endpoint: ${document.selectedRouterEndpoint || "unknown"}`,
+		`  Config repo:     ${document.configRepo || "unknown"}`,
 		`  Models:          ${models}`,
 		"",
 		"Release",
 		`  Tag:             ${document.releaseTag ?? "unknown"}`,
-		`  Digest:          ${document.releaseDigest ?? "unknown"}`,
-		`  Code print:      ${document.codeFingerprint ?? "unknown"}`,
-		`  Enclave print:   ${document.enclaveFingerprint ?? "unknown"}`,
+		`  Digest:          ${document.releaseDigest || "unknown"}`,
+		`  Code print:      ${document.codeFingerprint || "unknown"}`,
+		`  Enclave print:   ${document.enclaveFingerprint || "unknown"}`,
 		"",
 		"Attested keys",
-		`  TLS public key:  ${document.tlsPublicKey ?? "unknown"}`,
+		`  TLS public key:  ${document.tlsPublicKey || "unknown"}`,
 		`  TLS fingerprint: ${enclave.tlsPublicKeyFingerprint ?? "unknown"}`,
-		`  HPKE public key: ${document.hpkePublicKey ?? enclave.hpkePublicKey ?? "unknown"}`,
+		`  HPKE public key: ${document.hpkePublicKey || enclave.hpkePublicKey || "unknown"}`,
 		"",
 		"Measurements",
-		`  Code:            ${document.codeMeasurement?.type ?? "unknown"}`,
+		`  Code:            ${document.codeMeasurement?.type || "unknown"}`,
 		...(document.codeMeasurement?.registers ?? []).map((register) => `                   ${register}`),
 		`  Enclave:         ${enclave.measurement?.type ?? "unknown"}`,
 		...(enclave.measurement?.registers ?? []).map((register) => `                   ${register}`),
 		"",
+		"Verification steps",
+		...stepLines(document),
+		"",
 		"Verifier",
 		`  Verifier:        ${document.verifier?.name ?? "unknown"} ${document.verifier?.version ?? ""}`.trimEnd(),
-		`  Proxy:           ${document.runtime?.software?.name ?? "unknown"} ${document.runtime?.software?.version ?? ""}`.trimEnd(),
-		`  Instance:        ${document.runtime?.instanceId ?? "unknown"}`,
+		`  Verified:        ${document.securityVerified === true ? "yes" : "(SDK did not mark this document verified)"}`,
 		`  Verified at:     ${document.verifiedAt ?? "unknown"}`,
 	];
 }
@@ -397,77 +321,93 @@ function reportLines(state: ProxyState, baseUrl: string, models: number): string
 // =============================================================================
 
 export default async function (pi: ExtensionAPI) {
-	const baseUrl = process.env.TINFOIL_BASE_URL || DEFAULT_BASE_URL;
-	const isLoopback = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/.test(baseUrl);
-	const autostart = process.env.TINFOIL_AUTOSTART !== "0";
+	// Default config only: resolves the router, verifies SEV-SNP against the
+	// Sigstore-signed release digest, sets up HPKE body encryption.
+	const secureClient = new SecureClient();
 
-	let state = await probeProxy(baseUrl);
-	let probedAt = Date.now();
-	let autostartNote: string | undefined;
-
-	if (state.kind === "absent" && autostart && isLoopback) {
-		const result = await startProxy(baseUrl);
-		if (result.started) {
-			state = await probeProxy(baseUrl);
-			probedAt = Date.now();
-			autostartNote = `started ${PROXY_BIN} on ${baseUrl}.`;
-		} else {
-			autostartNote = result.reason;
+	// Fail closed on the extension, not on load: a startup failure (e.g.
+	// transient network) must not prevent pi from loading. The guard turns
+	// this state into a hard request block; /tinfoil retries it.
+	const verify = async (): Promise<VerifyState> => {
+		try {
+			await secureClient.ready();
+			return { kind: "verified" };
+		} catch (error) {
+			return { kind: "failed", reason: errorMessage(error) };
 		}
-	}
+	};
 
-	/** Re-probe when the cached result is older than the TTL, or when forced. */
-	const currentState = async (force = false): Promise<ProxyState> => {
-		if (force || Date.now() - probedAt > STATE_TTL_MS) {
-			state = await probeProxy(baseUrl);
-			probedAt = Date.now();
-		}
-		return state;
+	let state: VerifyState = await verify();
+
+	// Warn (do not fail) if the document layout drifts ahead of this extension.
+	const schemaNote = (): string | undefined => {
+		if (state.kind !== "verified") return undefined;
+		const version = secureClient.getVerificationDocument().schemaVersion;
+		return version === KNOWN_SCHEMA_VERSION
+			? undefined
+			: `the SDK reports document schema ${version ?? "(none)"}, and this extension knows ${KNOWN_SCHEMA_VERSION}. ` +
+				`Some fields in /tinfoil may read as "unknown". Update the extension.`;
 	};
 
 	/**
-	 * Refuse a request before any of it leaves the machine.
+	 * When verified, the SDK's resolved enclave URL, so requests land on the
+	 * host the attestation covers. When not, a placeholder default: the guard
+	 * blocks every request while unverified, so it never reaches the wire.
+	 */
+	const DEFAULT_API_URL = "https://inference.tinfoil.sh/v1";
+	const baseUrlOf = (): string =>
+		(state.kind === "verified" ? secureClient.getBaseURL() : undefined)?.replace(/\/+$/, "") ?? DEFAULT_API_URL;
+
+	const baseUrl = baseUrlOf();
+
+	/**
+	 * Wrap pi's OpenAI-completions adapter so every request rides the verified,
+	 * HPKE-encrypted channel.
 	 *
-	 * The UI cannot carry this decision: notifications exist only in interactive
-	 * mode, so print and JSON runs would send the key, system prompt, tools, and
-	 * user prompt with no signal at all. The request path is the only place that
-	 * covers every mode.
-	 *
-	 * The probe behind the gate is cached, because verification state changes
-	 * only when the enclave rotates, and a rotation cannot produce a bad verdict:
-	 * the proxy either re-verifies or fails the request itself.
+	 * 1. Fail closed: if verification failed, throw before any byte (key, system
+	 *    prompt, tools, user prompt) leaves the machine. Notifications only
+	 *    exist in interactive mode, so the request path is the only place that
+	 *    covers print/JSON runs too.
+	 * 2. Inject `secureClient.fetch`: pi-ai passes `options.fetch` to the OpenAI
+	 *    client, so this one hook covers every request. The SDK seals each body
+	 *    to the attested HPKE key, refuses origins other than the verified
+	 *    enclave, and re-attests on its own when the server rotates keys.
 	 */
 	const guard = (streams: ProviderStreams): ProviderStreams => {
-		const check = async () => {
-			if (!isLoopback) {
+		const ensureVerified = async () => {
+			if (state.kind !== "verified") {
 				throw new Error(
-					`Tinfoil: refusing to send this request. "${baseUrl}" is not the local proxy, so ` +
-						`nothing verifies the enclave at connection time. Unset TINFOIL_BASE_URL.`,
-				);
-			}
-			const now = await currentState();
-			if (now.kind === "unverified" && now.evidence === "bad-document") {
-				throw new Error(
-					`Tinfoil: refusing to send this request. ${now.reason} Run /tinfoil for detail, ` +
-						`or see ${HELP_URL}`,
+					`Tinfoil: refusing to send this request. Enclave verification failed: ${state.reason} ` +
+						`Run /tinfoil to retry, or see ${HELP_URL}`,
 				);
 			}
 		};
 		return {
 			stream: (model, context, options) =>
 				lazyStream(model, async () => {
-					await check();
-					return streams.stream(model, context, options);
+					await ensureVerified();
+					return streams.stream(model, context, { ...options, fetch: secureClient.fetch });
 				}),
 			streamSimple: (model, context, options) =>
 				lazyStream(model, async () => {
-					await check();
-					return streams.streamSimple(model, context, options);
+					await ensureVerified();
+					return streams.streamSimple(model, context, { ...options, fetch: secureClient.fetch });
 				}),
 		};
 	};
 
-	const discovery = await discoverModels(baseUrl);
+	// Discovery runs only when verified; when unverified there is no trusted
+	// channel, so register the fallback catalog. The picker stays usable and
+	// the guard still blocks requests.
+	let discovery: Discovery =
+		state.kind === "verified"
+			? await discoverModels(secureClient.fetch, baseUrl)
+			: {
+					models: FALLBACK_CATALOG.map((entry) => toModel(entry, baseUrl)),
+					skipped: [],
+					usedFallback: true,
+					error: `skipped (verification failed): ${state.reason}`,
+				};
 
 	pi.registerProvider(
 		createProvider({
@@ -475,10 +415,8 @@ export default async function (pi: ExtensionAPI) {
 			name: "Tinfoil",
 			baseUrl,
 			auth: { apiKey: envApiKeyAuth("Tinfoil API key", ["TINFOIL_API_KEY"]) },
-			// Discovered above, on every extension load, so each pi start gets the
-			// list the proxy serves right now. `fetchModels` would be dead code:
-			// `pi update --models` builds a runtime without extensions, so an
-			// extension provider never takes part in a catalog refresh. See TODO.md.
+			// Static list, discovered per extension load. `fetchModels` would be
+			// dead code: `pi update --models` runs without extensions loaded.
 			models: discovery.models,
 			api: guard(openAICompletionsApi()),
 		}),
@@ -496,11 +434,13 @@ export default async function (pi: ExtensionAPI) {
 
 	const usesTinfoil = (ctx: StatusContext) => ctx.model?.provider === PROVIDER_ID;
 
-	/**
-	 * The footer belongs to the active model. A Tinfoil status next to an
-	 * Anthropic model would claim a guarantee that does not apply to the
-	 * request in flight.
-	 */
+	// Fresh from the SDK at render time, so a rotation it recovered from on
+	// its own still shows up without us tracking it.
+	const documentOf = (): VerificationDocument | undefined =>
+		state.kind === "verified" ? secureClient.getVerificationDocument() : undefined;
+
+	// The footer belongs to the active model; a Tinfoil status next to another
+	// provider's model would claim a guarantee that does not apply.
 	const showStatus = (ctx: StatusContext, active = usesTinfoil(ctx)) => {
 		if (!active) {
 			ctx.ui.setStatus(PROVIDER_ID, undefined);
@@ -508,11 +448,11 @@ export default async function (pi: ExtensionAPI) {
 		}
 		const theme = ctx.ui.theme;
 		if (!theme) {
-			ctx.ui.setStatus(PROVIDER_ID, summary(state));
+			ctx.ui.setStatus(PROVIDER_ID, summary(state, documentOf()));
 			return;
 		}
 		const trusted = isTrusted(state);
-		const { verdict, detail } = summaryParts(state);
+		const { verdict, detail } = summaryParts(state, documentOf());
 		const parts = [
 			theme.fg("dim", verdict),
 			theme.fg(trusted ? "success" : "error", mark(trusted)),
@@ -521,35 +461,23 @@ export default async function (pi: ExtensionAPI) {
 		ctx.ui.setStatus(PROVIDER_ID, parts.filter(Boolean).join(" "));
 	};
 
-	const refresh = async (ctx: StatusContext, active?: boolean) => {
-		await currentState(true);
-		showStatus(ctx, active);
-	};
-
 	/** The warning that the current state deserves, or undefined when all is well. */
 	const warning = (): { message: string; level: "warning" | "error" } | undefined => {
-		if (!isLoopback) {
+		if (state.kind === "failed") {
 			return {
 				message:
-					`Tinfoil: base URL "${baseUrl}" is not the local proxy. Requests bypass ` +
-					`connection-time attestation, so the privacy guarantee is NOT verified. ` +
-					`Unset TINFOIL_BASE_URL.`,
-				level: "warning",
+					`Tinfoil: enclave verification failed: ${state.reason} ` +
+					`Requests are blocked. Run /tinfoil for the full report. See ${HELP_URL}`,
+				level: "error",
 			};
 		}
-		if (state.kind === "absent") {
-			const why = autostartNote ? ` Autostart failed: ${autostartNote}` : "";
-			return { message: `Tinfoil: no proxy at ${baseUrl}.${why} See ${HELP_URL}`, level: "warning" };
-		}
-		if (state.kind === "unverified") {
-			return { message: `Tinfoil: ${state.reason} Run /tinfoil for detail. See ${HELP_URL}`, level: "warning" };
-		}
-		if (state.note) return { message: `Tinfoil: ${state.note}`, level: "warning" };
+		const note = schemaNote();
+		if (note) return { message: `Tinfoil: ${note}`, level: "warning" };
 		return undefined;
 	};
 
-	// A transcript entry, not a notification: it renders in muted theme colors,
-	// so it never reads as agent output, and it stays out of the LLM context.
+	// A transcript entry rather than a notification: it renders in muted theme
+	// colors and stays out of the LLM context.
 	pi.registerEntryRenderer<TinfoilReport>(ENTRY_TYPE, (entry, { expanded }, theme) => {
 		const data = entry.data;
 		const box = new Box(1, 0);
@@ -570,23 +498,32 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerCommand(PROVIDER_ID, {
 		description: "Show the Tinfoil enclave verification document",
 		handler: async (_args, ctx) => {
-			await refresh(ctx);
+			// reset() drops the cached attestation so ready() re-checks everything
+			// from scratch. Also the recovery path for a startup failure.
+			secureClient.reset();
+			state = await verify();
+
+			// A fresh verification may resolve a different enclave or catalog.
+			if (state.kind === "verified") {
+				discovery = await discoverModels(secureClient.fetch, baseUrlOf());
+			}
+
+			showStatus(ctx);
 			pi.appendEntry<TinfoilReport>(ENTRY_TYPE, {
 				trusted: isTrusted(state),
-				summary: summary(state),
-				lines: reportLines(state, baseUrl, discovery.models.length),
+				summary: summary(state, documentOf()),
+				lines: reportLines(state, documentOf(), baseUrlOf(), discovery.models.length),
 			});
 		},
 	});
 
-	// Warn when the user picks a Tinfoil model, because that is the moment the
-	// guarantee starts to matter.
+	// Warn at model selection: that is when the guarantee starts to matter.
 	pi.on("model_select", async (event, ctx) => {
 		if (event.model?.provider !== PROVIDER_ID) {
 			ctx.ui.setStatus(PROVIDER_ID, undefined);
 			return;
 		}
-		await refresh(ctx, true);
+		showStatus(ctx, true);
 		const problem = warning();
 		if (problem) ctx.ui.notify(problem.message, problem.level);
 	});
@@ -594,24 +531,22 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		showStatus(ctx);
 
-		// One message per session. A stack of warnings for a single root cause
-		// trains users to ignore all of them.
+		// One message per session; a stack of warnings trains users to ignore them.
 		const problem = warning();
 
-		// Stay quiet for users of other providers. The exception is a provider
-		// with no models: nothing can select it, so silence would hide the cause
-		// forever.
+		// Stay quiet for users of other providers. Exception: a provider with no
+		// models can never be selected, so silence would hide the cause forever.
 		if (!usesTinfoil(ctx) && discovery.models.length > 0) return;
 
 		if (problem) {
 			ctx.ui.notify(problem.message, problem.level);
-			return;
-		}
-		if (autostartNote) ctx.ui.notify(`Tinfoil: ${autostartNote}`, "info");
-		if (discovery.error) {
-			ctx.ui.notify(`Tinfoil: model discovery failed (${discovery.error}).`, "warning");
+		} else if (discovery.usedFallback) {
+			ctx.ui.notify(
+				`Tinfoil: model discovery failed (${discovery.error}), so the built-in fallback catalog is in use.`,
+				"warning",
+			);
 		} else if (!discovery.models.length) {
-			ctx.ui.notify("Tinfoil: the proxy served no usable chat models.", "warning");
+			ctx.ui.notify("Tinfoil: the enclave served no usable chat models.", "warning");
 		}
 	});
 }

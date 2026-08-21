@@ -6,39 +6,37 @@ enclaves that even Tinfoil cannot read into.
 
 ## Setup
 
-1. Install the Tinfoil Proxy. See
-   [tinfoil.sh/coding-agents](https://tinfoil.sh/coding-agents), or build it
-   from [source](https://github.com/tinfoilsh/tinfoil-proxy).
-
-2. Install the extension:
+1. Install the extension:
 
    ```bash
    pi install npm:@tinfoilsh/pi-provider
    ```
 
-3. Start pi and set your API key:
+2. Start pi and set your API key:
 
    ```
    /login tinfoil
    ```
 
-4. Pick a Tinfoil model with `/model`.
+3. Pick a Tinfoil model with `/model`.
 
-If the proxy is not running, this extension starts it for you.
+## How verification works
 
-## Why the proxy
+When pi starts, the extension uses the [`tinfoil`
+SDK](https://github.com/tinfoilsh/tinfoil-js) to verify the inference
+enclave: it checks the enclave's attestation, confirms the running code
+against the release digest signed in Sigstore, and binds the attested key
+to the live connection. Every request body is then encrypted end-to-end
+with HPKE, so only the verified enclave can read it.
 
-Tinfoil's privacy guarantee depends on a client that checks the enclave's
-attestation as it connects. Pi cannot do that on its own. The proxy can, so
-this extension always sends your requests through it.
-
-Run `/tinfoil` at any time to see what the proxy verified. The footer shows a
-short version while a Tinfoil model is active.
+While a Tinfoil model is active, the footer shows: `Tinfoil verified` or
+`Tinfoil unverified`. Run `/tinfoil` at any time to re-run the verification
+from scratch and print the verification document. If verification fails,
+the extension fails closed: requests are blocked until `/tinfoil` succeeds.
+A failed verification cannot send your prompts anywhere.
 
 ## Settings
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TINFOIL_API_KEY` | _(none)_ | Your `tk_…` key. `/login tinfoil` is easier, because it survives a restart. |
-| `TINFOIL_BASE_URL` | `http://127.0.0.1:3301/v1` | Change this only if the proxy uses a different local port. Addresses that are not local are refused. |
-| `TINFOIL_AUTOSTART` | `1` | Set to `0` to never start the proxy. |
+| `TINFOIL_API_KEY` | _(none)_ | Your `tk_…` key, for headless workflows. Does not need to be set if using `/login tinfoil`, the preferred login for everyday operation. |
