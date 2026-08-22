@@ -1,6 +1,6 @@
 {
 	"name": "@tinfoilsh/pi-provider",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Verifiably-private models from Tinfoil secure enclaves, for the pi coding agent",
 	"type": "module",
 	"license": "Apache-2.0",
@@ -44,7 +44,8 @@
 		"access": "public"
 	},
 	"dependencies": {
-		"tinfoil": "^1.2.1"
+		"tinfoil": "^1.2.1",
+		"zod": "^4.4.3"
 	},
 	"devDependencies": {
 		"@types/node": "^26.2.0",
