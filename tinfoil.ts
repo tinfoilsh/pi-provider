@@ -96,6 +96,12 @@ function toModel(raw: TinfoilApiModel, baseUrl: string): Model<"openai-completio
 		},
 		contextWindow,
 		maxTokens: raw.max_tokens ?? deriveMaxTokens(contextWindow),
+		compat: {
+			// The enclave's chat-completions server accepts only system/user/assistant/tool;
+			// a `developer` role (which pi otherwise sends for reasoning models) is rejected with
+			// `400: Unknown message role 'developer' at index 0` before generation starts.
+			supportsDeveloperRole: false,
+		},
 	};
 }
 
