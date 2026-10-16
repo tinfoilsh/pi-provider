@@ -69,6 +69,7 @@ interface TinfoilApiModel {
 	pricing?: {
 		inputTokenPricePer1M?: number;
 		outputTokenPricePer1M?: number;
+		cachedInputTokenPricePer1M?: number;
 		requestPrice?: number;
 	};
 }
@@ -91,7 +92,7 @@ function toModel(raw: TinfoilApiModel, baseUrl: string): Model<"openai-completio
 		cost: {
 			input: raw.pricing?.inputTokenPricePer1M ?? 0,
 			output: raw.pricing?.outputTokenPricePer1M ?? 0,
-			cacheRead: 0,
+			cacheRead: raw.pricing?.cachedInputTokenPricePer1M ?? 0,
 			cacheWrite: 0,
 		},
 		contextWindow,
