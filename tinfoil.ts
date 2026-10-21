@@ -7,6 +7,7 @@ import {
 	type Model,
 	openAICompletionsApi,
 	type ProviderStreams,
+	type ThinkingLevelMap,
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
@@ -66,6 +67,8 @@ interface TinfoilApiModel {
 	reasoning?: boolean;
 	multimodal?: boolean;
 	tool_calling?: boolean;
+	/** Reasoning-effort vocabulary keyed by pi's thinking levels (MODEL_OVERRIDES). */
+	thinking_levels?: ThinkingLevelMap;
 	pricing?: {
 		inputTokenPricePer1M?: number;
 		outputTokenPricePer1M?: number;
@@ -74,12 +77,29 @@ interface TinfoilApiModel {
 	};
 }
 
+/**
+ * Per-model facts /v1/models does not report, keyed by model id and applied
+ * to live-discovered and fallback entries alike.
+ *
+ * `thinking_levels`: the model's vocabulary for the reasoning-effort
+ * parameter, keyed by pi's thinking levels. Kimi K3 accepts only
+ * low | high | max; pi's default "medium" is rejected with HTTP 400. No `off`
+ * entry on purpose: pi then omits the parameter (`off: null` would make pi
+ * clamp off → low instead).
+ */
+const MODEL_OVERRIDES: Record<string, Pick<TinfoilApiModel, "thinking_levels">> = {
+	"kimi-k3": {
+		thinking_levels: { minimal: "low", low: "low", medium: "high", high: "high", xhigh: "max" },
+	},
+};
+
 /** /v1/models reports no output-token limit; derive a conservative one. */
 function deriveMaxTokens(contextWindow: number): number {
 	return Math.min(32768, Math.max(4096, Math.floor(contextWindow / 8)));
 }
 
-function toModel(raw: TinfoilApiModel, baseUrl: string): Model<"openai-completions"> {
+function toModel(discovered: TinfoilApiModel, baseUrl: string): Model<"openai-completions"> {
+	const raw = { ...MODEL_OVERRIDES[discovered.id ?? ""], ...discovered };
 	const contextWindow = raw.context_window ?? 128000;
 	return {
 		id: raw.id as string,
@@ -97,6 +117,12 @@ function toModel(raw: TinfoilApiModel, baseUrl: string): Model<"openai-completio
 		},
 		contextWindow,
 		maxTokens: raw.max_tokens ?? deriveMaxTokens(contextWindow),
+		...(raw.thinking_levels ? { thinkingLevelMap: raw.thinking_levels } : {}),
+		// The Tinfoil router accepts the system prompt only as role `system`.
+		// pi sends `developer` for any reasoning model whose base URL is not
+		// on its non-standard list ("Unknown message role 'developer'", HTTP
+		// 400, found live 2026-10-21).
+		compat: { supportsDeveloperRole: false },
 	};
 }
 
