@@ -117,6 +117,16 @@ function isUsable(raw: TinfoilApiModel): boolean {
  */
 const FALLBACK_CATALOG: TinfoilApiModel[] = [
 	{
+		id: "kimi-k3-1-pro",
+		name: "Kimi K3.1 Pro",
+		type: "chat",
+		context_window: 1048576,
+		reasoning: true,
+		multimodal: true,
+		tool_calling: true,
+		pricing: { inputTokenPricePer1M: 4, outputTokenPricePer1M: 20 },
+	},
+	{
 		id: "kimi-k3",
 		name: "Kimi K3",
 		type: "chat",
