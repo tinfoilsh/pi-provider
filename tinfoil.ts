@@ -35,6 +35,14 @@ const HELP_URL = "https://tinfoil.sh/coding-agents";
 
 const DISCOVER_TIMEOUT_MS = 8000;
 
+/**
+ * Every model's base URL. Only the guard's fetch sends it to the verified
+ * enclave, so a pi that ignores that fetch (pi-ai before 0.83 did) cannot
+ * reach a real host: `.invalid` is reserved by RFC 2606 and never resolves.
+ */
+const PLACEHOLDER_BASE_URL = "https://tinfoil.invalid/v1";
+const PLACEHOLDER_ORIGIN = new URL(PLACEHOLDER_BASE_URL).origin;
+
 // =============================================================================
 // Verification state
 // =============================================================================
@@ -79,14 +87,14 @@ function deriveMaxTokens(contextWindow: number): number {
 	return Math.min(32768, Math.max(4096, Math.floor(contextWindow / 8)));
 }
 
-function toModel(raw: TinfoilApiModel, baseUrl: string): Model<"openai-completions"> {
+function toModel(raw: TinfoilApiModel): Model<"openai-completions"> {
 	const contextWindow = raw.context_window ?? 128000;
 	return {
 		id: raw.id as string,
 		name: raw.name ?? (raw.id as string),
 		api: "openai-completions",
 		provider: PROVIDER_ID,
-		baseUrl,
+		baseUrl: PLACEHOLDER_BASE_URL,
 		reasoning: raw.reasoning === true,
 		input: raw.multimodal ? ["text", "image"] : ["text"],
 		cost: {
@@ -186,7 +194,7 @@ interface Discovery {
  * Discover models through the verified client; the response is OpenAI-shaped.
  * The client's `fetch` refuses any origin but the verified enclave.
  */
-async function discoverModels(client: RouterHTTPClient, baseUrl: string): Promise<Discovery> {
+async function discoverModels(client: RouterHTTPClient): Promise<Discovery> {
 	try {
 		const response = await client.fetch(new URL("v1/models", client.baseURL), {
 			signal: AbortSignal.timeout(DISCOVER_TIMEOUT_MS),
@@ -195,13 +203,13 @@ async function discoverModels(client: RouterHTTPClient, baseUrl: string): Promis
 		const body = (await response.json()) as { data?: TinfoilApiModel[] };
 		const raw = body.data ?? [];
 		return {
-			models: raw.filter(isUsable).map((entry) => toModel(entry, baseUrl)),
+			models: raw.filter(isUsable).map(toModel),
 			skipped: raw.filter((entry) => !isUsable(entry)).map((entry) => entry.id ?? "(unnamed)"),
 			usedFallback: false,
 		};
 	} catch (error) {
 		return {
-			models: FALLBACK_CATALOG.map((entry) => toModel(entry, baseUrl)),
+			models: FALLBACK_CATALOG.map(toModel),
 			skipped: [],
 			usedFallback: true,
 			error: errorMessage(error),
@@ -277,11 +285,10 @@ function measurementLines(label: string, measurement: Measurement): string[] {
 function reportLines(
 	state: VerifyState,
 	verification: Verification | undefined,
-	baseUrl: string,
 	models: number,
 ): string[] {
 	if (state.kind !== "verified" || !verification) {
-		// No base URL: nothing was verified, so it would only be the placeholder default.
+		// No base URL: nothing was verified, so there is no enclave URL to show.
 		return [
 			`Reason:    ${state.kind === "failed" ? state.reason : "no verification"}`,
 			"",
@@ -293,7 +300,7 @@ function reportLines(
 	const facts = verification.toJSON();
 	return [
 		"Connection",
-		`  Base URL:        ${baseUrl}`,
+		`  Base URL:        ${state.client.baseURL}v1`,
 		`  Enclave host:    ${state.client.enclave || "unknown"}`,
 		`  Config repo:     ${facts.configRepo || "unknown"}`,
 		`  Models:          ${models}`,
@@ -366,14 +373,29 @@ export default async function (pi: ExtensionAPI) {
 	let state: VerifyState = await verify();
 
 	/**
-	 * When verified, the SDK's resolved enclave URL, so requests land on the
-	 * host the attestation covers. When not, a placeholder default: the guard
-	 * blocks every request while unverified, so it never reaches the wire.
+	 * The client's fetch, with the placeholder origin swapped for the verified
+	 * enclave's. Only the scheme and host change, so nothing in the path can
+	 * move the request elsewhere; the placeholder's `/v1` path is kept, and
+	 * `baseURL` is the router's root. Any other origin is passed on as is, and
+	 * the SDK refuses it.
 	 */
-	const DEFAULT_API_URL = "https://inference.tinfoil.sh/v1";
-	const baseUrlOf = (): string => (state.kind === "verified" ? `${state.client.baseURL}v1` : DEFAULT_API_URL);
-
-	const baseUrl = baseUrlOf();
+	const enclaveFetch =
+		(verified: RouterHTTPClient): typeof fetch =>
+		(input, init) => {
+			const swap = (raw: string): string => {
+				const url = new URL(raw);
+				if (url.origin !== PLACEHOLDER_ORIGIN) return raw;
+				const enclave = new URL(verified.baseURL);
+				url.protocol = enclave.protocol;
+				url.host = enclave.host;
+				return url.toString();
+			};
+			if (input instanceof Request) {
+				const swapped = swap(input.url);
+				return verified.fetch(swapped === input.url ? input : new Request(swapped, input), init);
+			}
+			return verified.fetch(swap(String(input)), init);
+		};
 
 	/**
 	 * Wrap pi's OpenAI-completions adapter so every request rides the verified,
@@ -383,10 +405,14 @@ export default async function (pi: ExtensionAPI) {
 	 *    prompt, tools, user prompt) leaves the machine. Notifications only
 	 *    exist in interactive mode, so the request path is the only place that
 	 *    covers print/JSON runs too.
-	 * 2. Inject the verified client's `fetch`: pi-ai passes `options.fetch` to
-	 *    the OpenAI client, so this one hook covers every request. The SDK pins
-	 *    each connection to the attested key, refuses origins other than the
-	 *    verified enclave, and re-verifies on its own when the server rotates keys.
+	 * 2. Inject the verified client's `fetch`: pi-ai 0.83 and later pass
+	 *    `options.fetch` to the OpenAI client, so this one hook covers every
+	 *    request (older pi-ai ignores it and fails on the placeholder). It sends the
+	 *    models' placeholder URL to the enclave the client verified, so a model
+	 *    registered before a /tinfoil re-verify still reaches the right one. The
+	 *    SDK pins each connection to the attested key, refuses origins other
+	 *    than the verified enclave, and re-verifies on its own when the server
+	 *    rotates keys.
 	 */
 	const guard = (streams: ProviderStreams): ProviderStreams => {
 		const requireVerified = async () => {
@@ -396,20 +422,18 @@ export default async function (pi: ExtensionAPI) {
 						`Run /tinfoil to retry, or see ${HELP_URL}`,
 				);
 			}
-			return state.client.fetch;
+			return enclaveFetch(state.client);
 		};
 		return {
 			stream: (model, context, options) =>
 				lazyStream(model, async () => {
 					const fetch = await requireVerified();
-					// Models keep the baseUrl from load time; a /tinfoil re-verify may
-					// have moved to another enclave, so pin to the verified one.
-					return streams.stream({ ...model, baseUrl: baseUrlOf() }, context, { ...options, fetch });
+					return streams.stream(model, context, { ...options, fetch });
 				}),
 			streamSimple: (model, context, options) =>
 				lazyStream(model, async () => {
 					const fetch = await requireVerified();
-					return streams.streamSimple({ ...model, baseUrl: baseUrlOf() }, context, { ...options, fetch });
+					return streams.streamSimple(model, context, { ...options, fetch });
 				}),
 		};
 	};
@@ -419,9 +443,9 @@ export default async function (pi: ExtensionAPI) {
 	// the guard still blocks requests.
 	let discovery: Discovery =
 		state.kind === "verified"
-			? await discoverModels(state.client, baseUrl)
+			? await discoverModels(state.client)
 			: {
-					models: FALLBACK_CATALOG.map((entry) => toModel(entry, baseUrl)),
+					models: FALLBACK_CATALOG.map(toModel),
 					skipped: [],
 					usedFallback: true,
 					error: `skipped (verification failed): ${state.reason}`,
@@ -431,7 +455,7 @@ export default async function (pi: ExtensionAPI) {
 		createProvider({
 			id: PROVIDER_ID,
 			name: "Tinfoil",
-			baseUrl,
+			baseUrl: PLACEHOLDER_BASE_URL,
 			auth: { apiKey: envApiKeyAuth("Tinfoil API key", ["TINFOIL_API_KEY"]) },
 			// Static list, discovered per extension load. `fetchModels` would be
 			// dead code: `pi update --models` runs without extensions loaded.
@@ -519,14 +543,14 @@ export default async function (pi: ExtensionAPI) {
 
 			// A fresh verification may resolve a different enclave or catalog.
 			if (state.kind === "verified") {
-				discovery = await discoverModels(state.client, baseUrlOf());
+				discovery = await discoverModels(state.client);
 			}
 
 			showStatus(ctx);
 			pi.appendEntry<TinfoilReport>(ENTRY_TYPE, {
 				trusted: isTrusted(state),
 				summary: summary(state, verificationOf()),
-				lines: reportLines(state, verificationOf(), baseUrlOf(), discovery.models.length),
+				lines: reportLines(state, verificationOf(), discovery.models.length),
 			});
 		},
 	});
