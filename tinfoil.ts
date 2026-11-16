@@ -44,7 +44,8 @@ const DISCOVER_TIMEOUT_MS = 8000;
  *
  * No "stale" state and no refresh TTL: a client only exists once verified, and
  * its `fetch` verifies again on its own when the verification expires or the
- * enclave rotates keys. Renderers read `client.current` on every call, so a
+ * enclave rotates keys. A client is closed only once a newly verified one
+ * replaces it. Renderers read `client.current` on every call, so a
  * recovered rotation still shows up.
  */
 type VerifyState =
@@ -332,23 +333,35 @@ export default async function (pi: ExtensionAPI) {
 	// A retry first re-verifies the router we have, and falls back to fresh
 	// discovery, which may pick a different router.
 	let client: RouterHTTPClient | undefined;
-	const verify = async (): Promise<VerifyState> => {
-		if (client) {
+	const attempt = async (): Promise<VerifyState> => {
+		const previous = client;
+		if (previous) {
 			try {
-				await client.reverify();
-				return { kind: "verified", client };
+				await previous.reverify();
+				return { kind: "verified", client: previous };
 			} catch {
-				void client.close();
-				client = undefined;
+				// Discover again, keeping the old client open in case that fails:
+				// a reply may still be streaming over it, and the "failed" state
+				// already blocks new requests. Replacing it does close it, ending
+				// such a reply, but then its router has just failed to verify.
 			}
 		}
 		try {
 			client = await RouterHTTPClient.create();
+			void previous?.close();
 			return { kind: "verified", client };
 		} catch (error) {
 			return { kind: "failed", reason: errorMessage(error) };
 		}
 	};
+
+	// One attempt at a time: /tinfoil can run again while an attempt is in
+	// flight, and two attempts would race to replace `client`.
+	let pending: Promise<VerifyState> | undefined;
+	const verify = (): Promise<VerifyState> =>
+		(pending ??= attempt().finally(() => {
+			pending = undefined;
+		}));
 
 	let state: VerifyState = await verify();
 
