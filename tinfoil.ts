@@ -228,7 +228,16 @@ function mark(trusted: boolean): string {
 }
 
 function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+	const message = error instanceof Error ? error.message : String(error);
+	// The SDK retries verification once and appends the first attempt's error;
+	// drop it when both attempts failed the same way.
+	const attempts = /^(.*) \(first attempt: (.*)\)$/s.exec(message);
+	return attempts && attempts[1] === attempts[2] ? attempts[1] : message;
+}
+
+/** End a reason with a period, so the hint that follows it starts a new sentence. */
+function sentence(reason: string): string {
+	return /[.!?]$/.test(reason) ? reason : `${reason}.`;
 }
 
 /** Verdict and detail as separate parts so callers can color the marker on its own. */
@@ -271,8 +280,8 @@ function reportLines(
 	models: number,
 ): string[] {
 	if (state.kind !== "verified" || !verification) {
+		// No base URL: nothing was verified, so it would only be the placeholder default.
 		return [
-			`Base URL:  ${baseUrl}`,
 			`Reason:    ${state.kind === "failed" ? state.reason : "no verification"}`,
 			"",
 			`Run /tinfoil to retry verification. See ${HELP_URL}`,
@@ -370,7 +379,7 @@ export default async function (pi: ExtensionAPI) {
 		const requireVerified = async () => {
 			if (state.kind !== "verified") {
 				throw new Error(
-					`Tinfoil: refusing to send this request. Enclave verification failed: ${state.reason} ` +
+					`Tinfoil: refusing to send this request. Enclave verification failed: ${sentence(state.reason)} ` +
 						`Run /tinfoil to retry, or see ${HELP_URL}`,
 				);
 			}
@@ -461,7 +470,7 @@ export default async function (pi: ExtensionAPI) {
 		if (state.kind === "failed") {
 			return {
 				message:
-					`Tinfoil: enclave verification failed: ${state.reason} ` +
+					`Tinfoil: enclave verification failed: ${sentence(state.reason)} ` +
 					`Requests are blocked. Run /tinfoil for the full report. See ${HELP_URL}`,
 				level: "error",
 			};
