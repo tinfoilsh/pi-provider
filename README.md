@@ -24,14 +24,14 @@ enclaves that even Tinfoil cannot read into.
 
 When pi starts, the extension uses the [`tinfoil`
 SDK](https://github.com/tinfoilsh/tinfoil-js) to verify the inference
-enclave: it checks the enclave's attestation, confirms the running code
-against the release digest signed in Sigstore, and binds the attested key
-to the live connection. Every request body is then encrypted end-to-end
-with HPKE, so only the verified enclave can read it.
+enclave: it checks the enclave's attestation document and confirms the
+running code against the release digest signed in Sigstore. Every
+connection is then pinned to the attested TLS key, so only the verified
+enclave can read your requests.
 
 While a Tinfoil model is active, the footer shows: `Tinfoil verified` or
-`Tinfoil unverified`. Run `/tinfoil` at any time to re-run the verification
-from scratch and print the verification document. If verification fails,
+`Tinfoil unverified`. Run `/tinfoil` at any time to verify again and print
+what the verification proved. If verification fails,
 the extension fails closed: requests are blocked until `/tinfoil` succeeds.
 A failed verification cannot send your prompts anywhere.
 

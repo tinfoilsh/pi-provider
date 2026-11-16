@@ -12,15 +12,18 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 // Resolves from this package's node_modules: pi loads extensions with jiti,
 // which uses normal Node resolution for anything it does not alias.
-import { SecureClient, type VerificationDocument } from "tinfoil";
+import { RouterHTTPClient } from "tinfoil";
+
+/** What a successful verification proves; the SDK re-exports it only as `current`. */
+type Verification = NonNullable<RouterHTTPClient["current"]>;
 
 /**
  * Tinfoil provider for the pi coding agent.
  *
- * Attestation and encryption happen in-process via the `tinfoil` SDK: it
- * verifies the enclave's SEV-SNP attestation and Sigstore-signed code digest,
- * and encrypts every request body end-to-end with HPKE. Not a full external
- * verifier (no independent AMD signature-chain check); for that use
+ * Attestation happens in-process via the `tinfoil` SDK: it verifies the
+ * enclave's attestation document against the Sigstore-signed release, and pins
+ * every connection to the attested TLS key so only the verified enclave can
+ * read a request. Not a full external verifier; for that use
  * github.com/tinfoilsh/tinfoil-cli.
  *
  * See README.md for setup.
@@ -32,10 +35,6 @@ const HELP_URL = "https://tinfoil.sh/coding-agents";
 
 const DISCOVER_TIMEOUT_MS = 8000;
 
-// The document layout this extension was written against. Drift is a
-// warning, not a failure: the attestation behind the fields is still checked.
-const KNOWN_SCHEMA_VERSION = 1;
-
 // =============================================================================
 // Verification state
 // =============================================================================
@@ -43,13 +42,13 @@ const KNOWN_SCHEMA_VERSION = 1;
 /**
  * The startup verdict. "failed" blocks every request (see the guard).
  *
- * No "stale" state and no refresh TTL: verification is bound to the live
- * connection and `SecureClient.fetch` re-attests on its own when the enclave
- * rotates keys. Renderers read the document fresh on every call, so a
+ * No "stale" state and no refresh TTL: a client only exists once verified, and
+ * its `fetch` verifies again on its own when the verification expires or the
+ * enclave rotates keys. Renderers read `client.current` on every call, so a
  * recovered rotation still shows up.
  */
 type VerifyState =
-	| { kind: "verified" }
+	| { kind: "verified"; client: RouterHTTPClient }
 	| { kind: "failed"; reason: string };
 
 // =============================================================================
@@ -183,13 +182,12 @@ interface Discovery {
 }
 
 /**
- * Discover models through the encrypted, verified channel; the response is
- * OpenAI-shaped. `SecureClient.fetch` resolves the relative URL against the
- * verified enclave and refuses any other origin.
+ * Discover models through the verified client; the response is OpenAI-shaped.
+ * The client's `fetch` refuses any origin but the verified enclave.
  */
-async function discoverModels(secureFetch: typeof fetch, baseUrl: string): Promise<Discovery> {
+async function discoverModels(client: RouterHTTPClient, baseUrl: string): Promise<Discovery> {
 	try {
-		const response = await secureFetch("/v1/models", {
+		const response = await client.fetch(new URL("v1/models", client.baseURL), {
 			signal: AbortSignal.timeout(DISCOVER_TIMEOUT_MS),
 		});
 		if (!response.ok) throw new Error(`HTTP ${response.status} from /v1/models`);
@@ -205,7 +203,7 @@ async function discoverModels(secureFetch: typeof fetch, baseUrl: string): Promi
 			models: FALLBACK_CATALOG.map((entry) => toModel(entry, baseUrl)),
 			skipped: [],
 			usedFallback: true,
-			error: error instanceof Error ? error.message : String(error),
+			error: errorMessage(error),
 		};
 	}
 }
@@ -234,14 +232,14 @@ function errorMessage(error: unknown): string {
 }
 
 /** Verdict and detail as separate parts so callers can color the marker on its own. */
-function summaryParts(state: VerifyState, document?: VerificationDocument): { verdict: string; detail: string } {
+function summaryParts(state: VerifyState, verification?: Verification): { verdict: string; detail: string } {
 	if (state.kind !== "verified") return { verdict: "Tinfoil unverified", detail: "" };
-	return { verdict: "Tinfoil verified", detail: shortHash(document?.releaseDigest) };
+	return { verdict: "Tinfoil verified", detail: shortHash(verification?.codeDigest) };
 }
 
 /** Plain one-line summary, marker included. */
-function summary(state: VerifyState, document?: VerificationDocument): string {
-	const { verdict, detail } = summaryParts(state, document);
+function summary(state: VerifyState, verification?: Verification): string {
+	const { verdict, detail } = summaryParts(state, verification);
 	return [verdict, mark(isTrusted(state)), detail].filter(Boolean).join(" ");
 }
 
@@ -252,70 +250,62 @@ interface TinfoilReport {
 	lines: string[];
 }
 
-/** One step line, in the order the verifier performs the steps. */
-function stepLines(document: VerificationDocument): string[] {
-	const steps = document.steps;
-	if (!steps) return [];
-	const entries: Array<[string, { status?: string; error?: string } | undefined]> = [
-		["Fetch digest", steps.fetchDigest],
-		["Verify code", steps.verifyCode],
-		["Verify enclave", steps.verifyEnclave],
-		["Compare measurements", steps.compareMeasurements],
-		["Verify certificate", steps.verifyCertificate],
+/** A measurement as the verification's JSON form gives it: the platform, then registers as hex. */
+type Measurement = ReturnType<Verification["toJSON"]>["codeMeasurement"];
+
+/** A measurement's set registers, one per line, labeled as the verifier names them. */
+function measurementLines(label: string, measurement: Measurement): string[] {
+	const { platform, ...registers } = measurement;
+	return [
+		`  ${label.padEnd(17)}${platform}`,
+		...Object.entries(registers)
+			.filter((pair): pair is [string, string] => Boolean(pair[1]))
+			.map(([name, value]) => `    ${name.padEnd(15)}${value}`),
 	];
-	return entries
-		.filter((pair): pair is [string, { status?: string; error?: string }] => pair[1] !== undefined)
-		.map(([name, step]) => `  ${name.padEnd(22)}${step.status ?? "unknown"}${step.error ? `: ${step.error}` : ""}`);
 }
 
 function reportLines(
 	state: VerifyState,
-	document: VerificationDocument | undefined,
+	verification: Verification | undefined,
 	baseUrl: string,
 	models: number,
 ): string[] {
-	if (state.kind !== "verified" || !document) {
+	if (state.kind !== "verified" || !verification) {
 		return [
 			`Base URL:  ${baseUrl}`,
-			`Reason:    ${state.kind === "failed" ? state.reason : "no verification document"}`,
+			`Reason:    ${state.kind === "failed" ? state.reason : "no verification"}`,
 			"",
 			`Run /tinfoil to retry verification. See ${HELP_URL}`,
 		];
 	}
 
-	const enclave = document.enclaveMeasurement ?? {};
+	// The JSON form renders registers as hex and drops facts that were not established.
+	const facts = verification.toJSON();
 	return [
 		"Connection",
 		`  Base URL:        ${baseUrl}`,
-		`  Enclave host:    ${document.enclaveHost || "unknown"}`,
-		`  Router endpoint: ${document.selectedRouterEndpoint || "unknown"}`,
-		`  Config repo:     ${document.configRepo || "unknown"}`,
+		`  Enclave host:    ${state.client.enclave || "unknown"}`,
+		`  Config repo:     ${facts.configRepo || "unknown"}`,
 		`  Models:          ${models}`,
 		"",
 		"Release",
-		`  Tag:             ${document.releaseTag ?? "unknown"}`,
-		`  Digest:          ${document.releaseDigest || "unknown"}`,
-		`  Code print:      ${document.codeFingerprint || "unknown"}`,
-		`  Enclave print:   ${document.enclaveFingerprint || "unknown"}`,
+		`  Tag:             ${facts.codeTag || "unknown"}`,
+		`  Digest:          ${facts.codeDigest || "unknown"}`,
+		...(facts.runtime ? [`  Runtime:         ${facts.runtime.repo}@${facts.runtime.tag} (${shortHash(facts.runtime.digest)})`] : []),
+		...(facts.config ? [`  Config:          ${facts.config.name || "unnamed"} (${shortHash(facts.config.digest)})`] : []),
 		"",
 		"Attested keys",
-		`  TLS public key:  ${document.tlsPublicKey || "unknown"}`,
-		`  TLS fingerprint: ${enclave.tlsPublicKeyFingerprint ?? "unknown"}`,
-		`  HPKE public key: ${document.hpkePublicKey || enclave.hpkePublicKey || "unknown"}`,
+		`  TLS fingerprint: ${verification.tlsPublicKeyFP ?? "unknown"}`,
+		`  HPKE public key: ${verification.hpkePublicKey ?? "unknown"}`,
 		"",
 		"Measurements",
-		`  Code:            ${document.codeMeasurement?.type || "unknown"}`,
-		...(document.codeMeasurement?.registers ?? []).map((register) => `                   ${register}`),
-		`  Enclave:         ${enclave.measurement?.type ?? "unknown"}`,
-		...(enclave.measurement?.registers ?? []).map((register) => `                   ${register}`),
-		"",
-		"Verification steps",
-		...stepLines(document),
+		...measurementLines("Code:", facts.codeMeasurement),
+		...measurementLines("Enclave:", facts.enclaveMeasurement),
 		"",
 		"Verifier",
-		`  Verifier:        ${document.verifier?.name ?? "unknown"} ${document.verifier?.version ?? ""}`.trimEnd(),
-		`  Verified:        ${document.securityVerified === true ? "yes" : "(SDK did not mark this document verified)"}`,
-		`  Verified at:     ${document.verifiedAt ?? "unknown"}`,
+		`  Verifier:        ${facts.metadata.verifier.name} ${facts.metadata.verifier.version}`,
+		`  Verified at:     ${facts.metadata.verifiedAt}`,
+		`  Fresh until:     ${facts.freshnessExpiresAt ?? "no expiry"}`,
 	];
 }
 
@@ -324,17 +314,28 @@ function reportLines(
 // =============================================================================
 
 export default async function (pi: ExtensionAPI) {
-	// Default config only: resolves the router, verifies SEV-SNP against the
-	// Sigstore-signed release digest, sets up HPKE body encryption.
-	const secureClient = new SecureClient();
-
 	// Fail closed on the extension, not on load: a startup failure (e.g.
 	// transient network) must not prevent pi from loading. The guard turns
 	// this state into a hard request block; /tinfoil retries it.
+	//
+	// Default config only: discovers the router and verifies its attestation
+	// document against the Sigstore-signed release before the client exists.
+	// A retry first re-verifies the router we have, and falls back to fresh
+	// discovery, which may pick a different router.
+	let client: RouterHTTPClient | undefined;
 	const verify = async (): Promise<VerifyState> => {
+		if (client) {
+			try {
+				await client.reverify();
+				return { kind: "verified", client };
+			} catch {
+				void client.close();
+				client = undefined;
+			}
+		}
 		try {
-			await secureClient.ready();
-			return { kind: "verified" };
+			client = await RouterHTTPClient.create();
+			return { kind: "verified", client };
 		} catch (error) {
 			return { kind: "failed", reason: errorMessage(error) };
 		}
@@ -342,60 +343,51 @@ export default async function (pi: ExtensionAPI) {
 
 	let state: VerifyState = await verify();
 
-	// Warn (do not fail) if the document layout drifts ahead of this extension.
-	const schemaNote = (): string | undefined => {
-		if (state.kind !== "verified") return undefined;
-		const version = secureClient.getVerificationDocument().schemaVersion;
-		return version === KNOWN_SCHEMA_VERSION
-			? undefined
-			: `the SDK reports document schema ${version ?? "(none)"}, and this extension knows ${KNOWN_SCHEMA_VERSION}. ` +
-				`Some fields in /tinfoil may read as "unknown". Update the extension.`;
-	};
-
 	/**
 	 * When verified, the SDK's resolved enclave URL, so requests land on the
 	 * host the attestation covers. When not, a placeholder default: the guard
 	 * blocks every request while unverified, so it never reaches the wire.
 	 */
 	const DEFAULT_API_URL = "https://inference.tinfoil.sh/v1";
-	const baseUrlOf = (): string =>
-		(state.kind === "verified" ? secureClient.getBaseURL() : undefined)?.replace(/\/+$/, "") ?? DEFAULT_API_URL;
+	const baseUrlOf = (): string => (state.kind === "verified" ? `${state.client.baseURL}v1` : DEFAULT_API_URL);
 
 	const baseUrl = baseUrlOf();
 
 	/**
 	 * Wrap pi's OpenAI-completions adapter so every request rides the verified,
-	 * HPKE-encrypted channel.
+	 * attested channel.
 	 *
 	 * 1. Fail closed: if verification failed, throw before any byte (key, system
 	 *    prompt, tools, user prompt) leaves the machine. Notifications only
 	 *    exist in interactive mode, so the request path is the only place that
 	 *    covers print/JSON runs too.
-	 * 2. Inject `secureClient.fetch`: pi-ai passes `options.fetch` to the OpenAI
-	 *    client, so this one hook covers every request. The SDK seals each body
-	 *    to the attested HPKE key, refuses origins other than the verified
-	 *    enclave, and re-attests on its own when the server rotates keys.
+	 * 2. Inject the verified client's `fetch`: pi-ai passes `options.fetch` to
+	 *    the OpenAI client, so this one hook covers every request. The SDK pins
+	 *    each connection to the attested key, refuses origins other than the
+	 *    verified enclave, and re-verifies on its own when the server rotates keys.
 	 */
 	const guard = (streams: ProviderStreams): ProviderStreams => {
-		const ensureVerified = async () => {
+		const requireVerified = async () => {
 			if (state.kind !== "verified") {
 				throw new Error(
 					`Tinfoil: refusing to send this request. Enclave verification failed: ${state.reason} ` +
 						`Run /tinfoil to retry, or see ${HELP_URL}`,
 				);
 			}
+			return state.client.fetch;
 		};
 		return {
 			stream: (model, context, options) =>
 				lazyStream(model, async () => {
-					await ensureVerified();
-					// Models may carry a stale baseUrl (registered before a /tinfoil re-verify); pin to the verified enclave.
-					return streams.stream({ ...model, baseUrl: baseUrlOf() }, context, { ...options, fetch: secureClient.fetch });
+					const fetch = await requireVerified();
+					// Models keep the baseUrl from load time; a /tinfoil re-verify may
+					// have moved to another enclave, so pin to the verified one.
+					return streams.stream({ ...model, baseUrl: baseUrlOf() }, context, { ...options, fetch });
 				}),
 			streamSimple: (model, context, options) =>
 				lazyStream(model, async () => {
-					await ensureVerified();
-					return streams.streamSimple({ ...model, baseUrl: baseUrlOf() }, context, { ...options, fetch: secureClient.fetch });
+					const fetch = await requireVerified();
+					return streams.streamSimple({ ...model, baseUrl: baseUrlOf() }, context, { ...options, fetch });
 				}),
 		};
 	};
@@ -405,7 +397,7 @@ export default async function (pi: ExtensionAPI) {
 	// the guard still blocks requests.
 	let discovery: Discovery =
 		state.kind === "verified"
-			? await discoverModels(secureClient.fetch, baseUrl)
+			? await discoverModels(state.client, baseUrl)
 			: {
 					models: FALLBACK_CATALOG.map((entry) => toModel(entry, baseUrl)),
 					skipped: [],
@@ -440,8 +432,7 @@ export default async function (pi: ExtensionAPI) {
 
 	// Fresh from the SDK at render time, so a rotation it recovered from on
 	// its own still shows up without us tracking it.
-	const documentOf = (): VerificationDocument | undefined =>
-		state.kind === "verified" ? secureClient.getVerificationDocument() : undefined;
+	const verificationOf = (): Verification | undefined => (state.kind === "verified" ? state.client.current : undefined);
 
 	// The footer belongs to the active model; a Tinfoil status next to another
 	// provider's model would claim a guarantee that does not apply.
@@ -452,11 +443,11 @@ export default async function (pi: ExtensionAPI) {
 		}
 		const theme = ctx.ui.theme;
 		if (!theme) {
-			ctx.ui.setStatus(PROVIDER_ID, summary(state, documentOf()));
+			ctx.ui.setStatus(PROVIDER_ID, summary(state, verificationOf()));
 			return;
 		}
 		const trusted = isTrusted(state);
-		const { verdict, detail } = summaryParts(state, documentOf());
+		const { verdict, detail } = summaryParts(state, verificationOf());
 		const parts = [
 			theme.fg("dim", verdict),
 			theme.fg(trusted ? "success" : "error", mark(trusted)),
@@ -475,8 +466,6 @@ export default async function (pi: ExtensionAPI) {
 				level: "error",
 			};
 		}
-		const note = schemaNote();
-		if (note) return { message: `Tinfoil: ${note}`, level: "warning" };
 		return undefined;
 	};
 
@@ -495,28 +484,27 @@ export default async function (pi: ExtensionAPI) {
 		for (const line of expanded ? data.lines : []) {
 			box.addChild(new Text(theme.fg("dim", line), 0, 0));
 		}
-		if (!expanded) box.addChild(new Text(theme.fg("dim", "  Expand for the full verification document."), 0, 0));
+		if (!expanded) box.addChild(new Text(theme.fg("dim", "  Expand for the full verification report."), 0, 0));
 		return box;
 	});
 
 	pi.registerCommand(PROVIDER_ID, {
-		description: "Show the Tinfoil enclave verification document",
+		description: "Verify the Tinfoil enclave again and show the report",
 		handler: async (_args, ctx) => {
-			// reset() drops the cached attestation so ready() re-checks everything
-			// from scratch. Also the recovery path for a startup failure.
-			secureClient.reset();
+			// Verifies again even if the cached verification is still valid. Also
+			// the recovery path for a startup failure.
 			state = await verify();
 
 			// A fresh verification may resolve a different enclave or catalog.
 			if (state.kind === "verified") {
-				discovery = await discoverModels(secureClient.fetch, baseUrlOf());
+				discovery = await discoverModels(state.client, baseUrlOf());
 			}
 
 			showStatus(ctx);
 			pi.appendEntry<TinfoilReport>(ENTRY_TYPE, {
 				trusted: isTrusted(state),
-				summary: summary(state, documentOf()),
-				lines: reportLines(state, documentOf(), baseUrlOf(), discovery.models.length),
+				summary: summary(state, verificationOf()),
+				lines: reportLines(state, verificationOf(), baseUrlOf(), discovery.models.length),
 			});
 		},
 	});
