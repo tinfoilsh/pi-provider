@@ -6,7 +6,7 @@ enclaves that even Tinfoil cannot read into.
 
 ## Setup
 
-1. Install the extension:
+1. Install the extension (needs pi 0.83.0 or later):
 
    ```bash
    pi install npm:@tinfoilsh/pi-provider

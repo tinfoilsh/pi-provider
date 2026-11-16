@@ -31,10 +31,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 0.81.0 is the oldest pi the provider loads in; 0.80 offers no Tinfoil
-        # models. Keeping it here means a fix for the newest pi cannot quietly
-        # drop support for older ones.
-        pi: [latest, 0.81.0]
+        # 0.83.0 is the oldest pi whose requests go through the provider's
+        # verified fetch; older ones load it but fail every request. Keeping it
+        # here means a fix for the newest pi cannot quietly drop support for it.
+        pi: [latest, 0.83.0]
     name: tree (pi ${{ matrix.pi }})
     timeout-minutes: 15
     env:
