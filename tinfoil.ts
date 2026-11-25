@@ -479,8 +479,15 @@ export default async function (pi: ExtensionAPI) {
 	const usesTinfoil = (ctx: StatusContext) => ctx.model?.provider === PROVIDER_ID;
 
 	// Fresh from the SDK at render time, so a rotation it recovered from on
-	// its own still shows up without us tracking it.
-	const verificationOf = (): Verification | undefined => (state.kind === "verified" ? state.client.currentVerification() : undefined);
+	// its own still shows up. The SDK drops its report once the verification
+	// expires, until the next request verifies again; show the last one meanwhile.
+	const lastReports = new WeakMap<RouterHTTPClient, Verification>();
+	const verificationOf = (): Verification | undefined => {
+		if (state.kind !== "verified") return undefined;
+		const report = state.client.currentVerification();
+		if (report) lastReports.set(state.client, report);
+		return report ?? lastReports.get(state.client);
+	};
 
 	// The footer belongs to the active model; a Tinfoil status next to another
 	// provider's model would claim a guarantee that does not apply.
