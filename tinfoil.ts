@@ -14,8 +14,8 @@ import { Box, Text } from "@earendil-works/pi-tui";
 // which uses normal Node resolution for anything it does not alias.
 import { RouterHTTPClient } from "tinfoil";
 
-/** What a successful verification proves; the SDK re-exports it only as `current`. */
-type Verification = NonNullable<RouterHTTPClient["current"]>;
+/** The report of the verification the client relies on; the SDK exposes it only through `currentVerification()`. */
+type Verification = NonNullable<ReturnType<RouterHTTPClient["currentVerification"]>>;
 
 /**
  * Tinfoil provider for the pi coding agent.
@@ -53,7 +53,7 @@ const PLACEHOLDER_ORIGIN = new URL(PLACEHOLDER_BASE_URL).origin;
  * No "stale" state and no refresh TTL: a client only exists once verified, and
  * its `fetch` verifies again on its own when the verification expires or the
  * enclave rotates keys. A client is closed only once a newly verified one
- * replaces it. Renderers read `client.current` on every call, so a
+ * replaces it. Renderers read `client.currentVerification()` on every call, so a
  * recovered rotation still shows up.
  */
 type VerifyState =
@@ -252,7 +252,7 @@ function sentence(reason: string): string {
 /** Verdict and detail as separate parts so callers can color the marker on its own. */
 function summaryParts(state: VerifyState, verification?: Verification): { verdict: string; detail: string } {
 	if (state.kind !== "verified") return { verdict: "Tinfoil unverified", detail: "" };
-	return { verdict: "Tinfoil verified", detail: shortHash(verification?.codeDigest) };
+	return { verdict: "Tinfoil verified", detail: shortHash(verification?.verifiedFacts?.codeDigest) };
 }
 
 /** Plain one-line summary, marker included. */
@@ -268,8 +268,8 @@ interface TinfoilReport {
 	lines: string[];
 }
 
-/** A measurement as the verification's JSON form gives it: the platform, then registers as hex. */
-type Measurement = ReturnType<Verification["toJSON"]>["codeMeasurement"];
+/** A measurement as the verified facts' JSON form gives it: the platform, then registers as hex. */
+type Measurement = ReturnType<NonNullable<Verification["verifiedFacts"]>["toJSON"]>["enclave_measurement"];
 
 /** A measurement's set registers, one per line, labeled as the verifier names them. */
 function measurementLines(label: string, measurement: Measurement): string[] {
@@ -287,7 +287,8 @@ function reportLines(
 	verification: Verification | undefined,
 	models: number,
 ): string[] {
-	if (state.kind !== "verified" || !verification) {
+	const verified = verification?.verifiedFacts;
+	if (state.kind !== "verified" || !verification || !verified) {
 		// No base URL: nothing was verified, so there is no enclave URL to show.
 		return [
 			`Reason:    ${state.kind === "failed" ? state.reason : "no verification"}`,
@@ -297,32 +298,33 @@ function reportLines(
 	}
 
 	// The JSON form renders registers as hex and drops facts that were not established.
-	const facts = verification.toJSON();
+	const facts = verified.toJSON();
+	const { metadata } = verification;
 	return [
 		"Connection",
 		`  Base URL:        ${state.client.baseURL}v1`,
 		`  Enclave host:    ${state.client.enclave || "unknown"}`,
-		`  Config repo:     ${facts.configRepo || "unknown"}`,
+		`  Config repo:     ${facts.config_repo || "unknown"}`,
 		`  Models:          ${models}`,
 		"",
 		"Release",
-		`  Tag:             ${facts.codeTag || "unknown"}`,
-		`  Digest:          ${facts.codeDigest || "unknown"}`,
+		`  Tag:             ${facts.code_tag || "unknown"}`,
+		`  Digest:          ${facts.code_digest || "unknown"}`,
 		...(facts.runtime ? [`  Runtime:         ${facts.runtime.repo}@${facts.runtime.tag} (${shortHash(facts.runtime.digest)})`] : []),
 		...(facts.config ? [`  Config:          ${facts.config.name || "unnamed"} (${shortHash(facts.config.digest)})`] : []),
 		"",
 		"Attested keys",
-		`  TLS fingerprint: ${verification.tlsPublicKeyFP ?? "unknown"}`,
-		`  HPKE public key: ${verification.hpkePublicKey ?? "unknown"}`,
+		`  TLS fingerprint: ${verified.tlsPublicKeyFP ?? "unknown"}`,
+		`  HPKE public key: ${verified.hpkePublicKey ?? "unknown"}`,
 		"",
 		"Measurements",
-		...measurementLines("Code:", facts.codeMeasurement),
-		...measurementLines("Enclave:", facts.enclaveMeasurement),
+		...(facts.code_measurement ? measurementLines("Code:", facts.code_measurement) : []),
+		...measurementLines("Enclave:", facts.enclave_measurement),
 		"",
 		"Verifier",
-		`  Verifier:        ${facts.metadata.verifier.name} ${facts.metadata.verifier.version}`,
-		`  Verified at:     ${facts.metadata.verifiedAt}`,
-		`  Fresh until:     ${facts.freshnessExpiresAt ?? "no expiry"}`,
+		`  Verifier:        ${metadata.verifier.name} ${metadata.verifier.version}`,
+		`  Verified at:     ${metadata.verifiedAt.toISOString()}`,
+		`  Fresh until:     ${facts.freshness_expires_at ?? "no expiry"}`,
 	];
 }
 
@@ -478,7 +480,7 @@ export default async function (pi: ExtensionAPI) {
 
 	// Fresh from the SDK at render time, so a rotation it recovered from on
 	// its own still shows up without us tracking it.
-	const verificationOf = (): Verification | undefined => (state.kind === "verified" ? state.client.current : undefined);
+	const verificationOf = (): Verification | undefined => (state.kind === "verified" ? state.client.currentVerification() : undefined);
 
 	// The footer belongs to the active model; a Tinfoil status next to another
 	// provider's model would claim a guarantee that does not apply.
