@@ -44,7 +44,7 @@
 		"access": "public"
 	},
 	"dependencies": {
-		"tinfoil": "^2.0.0-rc.2",
+		"tinfoil": "2.0.0-rc.6",
 		"zod": "^4.4.3"
 	},
 	"devDependencies": {
